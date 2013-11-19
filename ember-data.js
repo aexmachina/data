@@ -7,7 +7,7 @@
 
 
 
- // Version: 1.0.0-beta.4+canary.1fe2070d
+ // Version: 1.0.0-beta.4+canary.50b50cbb
 
 (function() {
 var define, requireModule;
@@ -62,7 +62,7 @@ var define, requireModule;
 var DS;
 if ('undefined' === typeof DS) {
   DS = Ember.Namespace.create({
-    VERSION: '1.0.0-beta.4+canary.1fe2070d'
+    VERSION: '1.0.0-beta.4+canary.50b50cbb'
   });
 
   if ('undefined' !== typeof window) {
@@ -218,9 +218,7 @@ DS.JSONSerializer = Ember.Object.extend({
   },
 
   extractArray: function(store, type, payload) {
-    return Ember.EnumerableUtils.map(payload, function (hash) {
-      serializer.normalize(type, hash);
-    }, this);
+    return this.normalize(type, payload);
   },
 
   extractMeta: function(store, type, payload) {
@@ -800,6 +798,14 @@ DS.AdapterPopulatedRecordArray = DS.RecordArray.extend({
   loadMore: function() {
     var request = get(this, 'request');
     request.loadMore(this);
+  },
+
+  loadPage: function( page ) {
+    var request = get(this, 'request'),
+        that = this;
+    request.loadPage(page).then(function (array) {
+      that.setObjects(get(array, 'content'));
+    });
   }
 
 });
@@ -1046,17 +1052,23 @@ DS.Request = Ember.Object.extend({
   },
 
   loadMore: function( array ) {
-    var store = get(this, 'store'),
-        type = get(this, 'type'),
-        query = get(this, 'query'),
+    var nextPage = +this.endPage + 1,
         that = this;
-
-    Ember.assert('You tried to call loadMore but no fetchPage method has been provided', this.fetchPage);
+    // ensure that pages are loaded in order
     this.promiseHead.then(function() {
-      that.promiseHead = that.fetchPage(store, type, query, ++that.endPage).then(function(more) {
+      that.promiseHead = that.loadPage(nextPage, array).then(function(more) {
         array.pushObjects(get(more, 'content'));
       });
     });
+  },
+
+  loadPage: function( page ) {
+    var store = get(this, 'store'),
+        type = get(this, 'type'),
+        query = get(this, 'query');
+    Ember.assert('You tried to call loadMore but no fetchPage method has been provided', this.fetchPage);
+    this.endPage = page;
+    return this.fetchPage(store, type, query, page);
   }
 
 });
@@ -2537,16 +2549,6 @@ DS.Store = Ember.Object.extend(DS._Mappable, {
     return toReturn;
   },
 
-  handlePagination: function(array, request) {
-    if( request.page && request.pageSize ) {
-      var start = request.page * request.pageSize;
-      return array.slice(start, start + request.pageSize);
-    }
-    else {
-      return array;
-    }
-  },
-
   // ......................
   // . PER-TYPE ADAPTERS
   // ......................
@@ -2772,7 +2774,7 @@ function _findAll(adapter, store, type, request) {
 
     var recordArray = DS.AdapterPopulatedRecordArray.create({
       type: type,
-      content: store.handlePagination(store.all(type), request),
+      content: payload,
       meta: store.metadataFor(type),
       store: this,
       request: request
@@ -5764,6 +5766,23 @@ DS.Adapter = Ember.Object.extend(DS._Mappable, {
   generateIdForRecord: null,
 
   /**
+   Request parameter to use for the page number.
+   */
+  pageParameter: 'page',
+
+  /**
+   The maximum number of results to be fetched by `findAll` or `findQuery`, optional.
+   @property 
+   */
+  pageSize: null,
+
+  /**
+   Request parameter to use for specifying the page size.
+   @property 
+   */
+  pageSizeParameter: 'pageSize',
+
+  /**
     Proxies to the serializer's `serialize` method.
 
     @method serialize
@@ -5835,12 +5854,6 @@ DS.Adapter = Ember.Object.extend(DS._Mappable, {
 
     return Ember.RSVP.all(promises);
   },
-
-  /**
-   The maximum number of results to be fetched by `findAll` or `findQuery`, optional.
-   @property 
-   */
-  pageSize: null,
 
   /**
     Create a Request that may specify a page number and size for pagination.
@@ -6026,10 +6039,20 @@ DS.FixtureAdapter = DS.Adapter.extend({
 
     Ember.assert("Unable to find fixtures for model type "+type.toString(), fixtures);
 
-    fixtures = store.handlePagination(fixtures, request);
+    fixtures = this.handlePagination(fixtures, request);
     return this.simulateRemoteCall(function() {
       return fixtures;
     }, this);
+  },
+
+  handlePagination: function(array, request) {
+    if( request.page && request.pageSize ) {
+      var start = (request.page - 1) * request.pageSize;
+      return array.slice(start, start + request.pageSize);
+    }
+    else {
+      return array;
+    }
   },
 
   /**
@@ -6046,7 +6069,7 @@ DS.FixtureAdapter = DS.Adapter.extend({
     Ember.assert("Unable to find fixtures for model type "+type.toString(), fixtures);
 
     fixtures = this.queryFixtures(fixtures, query, type);
-    fixtures = store.handlePagination(fixtures, request);
+    fixtures = this.handlePagination(fixtures, request);
 
     if (fixtures) {
       return this.simulateRemoteCall(function() {
@@ -7105,10 +7128,10 @@ DS.RESTAdapter = DS.Adapter.extend({
       query.since = request.sinceToken;
     }
     if (request.page) {
-      query[this.pageParameter || 'page'] = request.page;
+      query[this.pageParameter] = request.page;
     }
     if (request.pageSize) {
-      query[this.pageSizeParameter || 'pageSize'] = request.pageSize;
+      query[this.pageSizeParameter] = request.pageSize;
     }
     return query;
   },
