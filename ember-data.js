@@ -7,7 +7,7 @@
 
 
 
- // Version: 1.0.0-beta.4+canary.50b50cbb
+ // Version: 1.0.0-beta.4+canary.7f812ab4
 
 (function() {
 var define, requireModule;
@@ -62,7 +62,7 @@ var define, requireModule;
 var DS;
 if ('undefined' === typeof DS) {
   DS = Ember.Namespace.create({
-    VERSION: '1.0.0-beta.4+canary.50b50cbb'
+    VERSION: '1.0.0-beta.4+canary.7f812ab4'
   });
 
   if ('undefined' !== typeof window) {
@@ -105,6 +105,18 @@ DS.JSONSerializer = Ember.Object.extend({
     if (!hash) { return hash; }
 
     this.applyTransforms(type, hash);
+    return hash;
+  },
+
+  /**
+    You can use this method to apply any necessary transformations
+    so that any metadata provided in a response is mapped to the standard 
+    properties: `page`, `pageSize`, `total`, `isFinished`
+    @method normalizeMetadata
+    @param {DS.Model} type
+    @param {Object} hash
+   */
+  normalizeMetadata: function(type, hash) {
     return hash;
   },
 
@@ -218,12 +230,14 @@ DS.JSONSerializer = Ember.Object.extend({
   },
 
   extractArray: function(store, type, payload) {
-    return this.normalize(type, payload);
+    return Ember.EnumerableUtils.map(payload, function (hash) {
+      return this.normalize(type, hash);
+    }, this);
   },
 
   extractMeta: function(store, type, payload) {
     if (payload && payload.meta) {
-      store.metaForType(type, payload.meta);
+      store.metaForType(type, this.normalizeMetadata(type, payload.meta));
       delete payload.meta;
     }
   },
@@ -764,7 +778,7 @@ DS.FilteredRecordArray = DS.RecordArray.extend({
   @module ember-data
 */
 
-var get = Ember.get, set = Ember.set;
+var get = Ember.get, set = Ember.set, computed = Ember.computed;
 
 /**
   @class AdapterPopulatedRecordArray
@@ -773,6 +787,48 @@ var get = Ember.get, set = Ember.set;
 */
 DS.AdapterPopulatedRecordArray = DS.RecordArray.extend({
   query: null,
+
+  /**
+    The Request that was used to create this record array.
+    @property request
+    @type DS.Request
+  */
+  request: null,
+
+  endPage: null,
+  promiseHead: null,
+
+  init: function() {
+    this._super();
+    var page = this.request.page || 1;
+    set(this, 'startPage', page);
+    set(this, 'endPage', page);
+    this.promiseHead = this.request.deferred.promise;
+  },
+
+  pageBinding: 'request.page',
+
+  pageSize: Ember.computed(function() {
+    var pageSize = get(this, 'meta.pageSize');
+    if (!pageSize) {
+      pageSize = this.request.pageSize;
+    }
+    return pageSize;
+  }).property('meta.pageSize'),
+
+  totalBinding: 'meta.total',
+
+  totalPages: Ember.computed(function() {
+    var pageSize = get(this, 'pageSize'),
+        total = get(this, 'total');
+    if (pageSize > 0 && total !== undefined) {
+      return Math.ceil(total / pageSize);
+    }
+  }).property('pageSize', 'total'),
+
+  isFinished: Ember.computed(function() {
+    return get(this, 'meta.isFinished') || (get(this, 'endPage') >= get(this, 'totalPages'));
+  }).property('meta.isFinished', 'endPage', 'totalPages'),
 
   replace: function() {
     var type = get(this, 'type').toString();
@@ -796,15 +852,29 @@ DS.AdapterPopulatedRecordArray = DS.RecordArray.extend({
   },
 
   loadMore: function() {
-    var request = get(this, 'request');
-    request.loadMore(this);
+    var nextPage = +this.endPage + 1,
+        request = this.request,
+        resolver = Ember.RSVP.defer(),
+        reject = resolver.reject,
+        array = this;
+    // ensure that pages are loaded in order
+    this.promiseHead.then(function() {
+      request.promiseHead = request.loadPage(nextPage, array).then(function(more) {
+        set(array, 'endPage', nextPage);
+        array.pushObjects(get(more, 'content'));
+        resolver.resolve(array);
+      }, reject);
+    }, reject);
+    return resolver.promise;
   },
 
   loadPage: function( page ) {
     var request = get(this, 'request'),
-        that = this;
-    request.loadPage(page).then(function (array) {
-      that.setObjects(get(array, 'content'));
+        array = this;
+    return request.loadPage(page).then(function (more) {
+      set(array, 'startPage', page);
+      set(array, 'endPage', page);
+      array.setObjects(get(more, 'content'));
     });
   }
 
@@ -1041,33 +1111,17 @@ DS.Request = Ember.Object.extend({
   sinceToken: null,
   page: null,
   pageSize: null,
-  endPage: null,
-  promiseHead: null,
 
   init: function() {
-    this.endPage = this.page || 1;
     this.deferred = Ember.RSVP.defer();
-    this.promiseHead = this.deferred.promise;
-    this.sinceToken = this.store.typeMapFor(this.type).metadata.since;
-  },
-
-  loadMore: function( array ) {
-    var nextPage = +this.endPage + 1,
-        that = this;
-    // ensure that pages are loaded in order
-    this.promiseHead.then(function() {
-      that.promiseHead = that.loadPage(nextPage, array).then(function(more) {
-        array.pushObjects(get(more, 'content'));
-      });
-    });
+    this.sinceToken = this.store.metadataFor(this.type).since;
   },
 
   loadPage: function( page ) {
     var store = get(this, 'store'),
         type = get(this, 'type'),
         query = get(this, 'query');
-    Ember.assert('You tried to call loadMore but no fetchPage method has been provided', this.fetchPage);
-    this.endPage = page;
+    Ember.assert('You tried to call Request.loadPage but no fetchPage method has been provided', this.fetchPage);
     return this.fetchPage(store, type, query, page);
   }
 
@@ -1600,18 +1654,18 @@ DS.Store = Ember.Object.extend(DS._Mappable, {
 
     var type = record.constructor,
         id = get(record, 'id'),
-        request = DS.Request.create();
+        resolver = Ember.RSVP.defer();
 
-    record.loadingData(request.deferred.promise);
+    record.loadingData(resolver.promise);
 
     var adapter = this.adapterFor(type);
 
     Ember.assert("You tried to find a record but you have no adapter (for " + type + ")", adapter);
     Ember.assert("You tried to find a record but your adapter (for " + type + ") does not implement 'find'", adapter.find);
 
-    _find(adapter, this, type, id, request);
+    _find(adapter, this, type, id, resolver);
 
-    return request.deferred.promise;
+    return resolver.promise;
   },
 
   /**
@@ -2222,7 +2276,7 @@ DS.Store = Ember.Object.extend(DS._Mappable, {
     typeMap = {
       idToRecord: {},
       records: [],
-      metadata: {}
+      metadata: Ember.Object.create()
     };
 
     typeMaps[guid] = typeMap;
@@ -2385,7 +2439,7 @@ DS.Store = Ember.Object.extend(DS._Mappable, {
     store.pushPayload('post', pushData);
     ```
 
-    @method push
+    @method pushPayload
     @param {String} type
     @param {Object} payload
   */
@@ -2428,7 +2482,7 @@ DS.Store = Ember.Object.extend(DS._Mappable, {
   metaForType: function(type, metadata) {
     type = this.modelFor(type);
 
-    Ember.merge(this.typeMapFor(type).metadata, metadata);
+    this.typeMapFor(type).metadata.setProperties(metadata);
   },
 
   /**
@@ -2533,7 +2587,7 @@ DS.Store = Ember.Object.extend(DS._Mappable, {
   relationshipChangePairsFor: function(record){
     var toReturn = [];
 
-    if( !record ) { return toReturn; }
+    if (!record) { return toReturn; }
 
     //TODO(Igor) What about the other side
     var changesObject = this._relationshipChanges[record.clientId];
@@ -2772,15 +2826,19 @@ function _findAll(adapter, store, type, request) {
     store.pushMany(type, payload);
     store.didUpdateAll(type);
 
-    var recordArray = DS.AdapterPopulatedRecordArray.create({
-      type: type,
-      content: payload,
-      meta: store.metadataFor(type),
-      store: this,
-      request: request
-    });
-
-    return recordArray;
+    if (request.pageSize || store.metadataFor(type).pageSize) {
+      var recordArray = DS.AdapterPopulatedRecordArray.create({
+        type: type,
+        meta: store.metadataFor(type),
+        store: store,
+        request: request
+      });
+      recordArray.load(payload);
+      return recordArray;
+    }
+    else {
+      return store.all(type);
+    }
   }).then(request.deferred.resolve, request.deferred.reject);
 }
 
@@ -3383,7 +3441,11 @@ var RootState = {
 
       didCommit: function(record) {
         record.send('invokeLifecycleCallbacks', get(record, 'lastDirtyType'));
-      }
+      },
+
+      // loaded.saved.notFound would be triggered by a failed
+      // `reload()` on an unchanged record
+      notFound: Ember.K
 
     },
 
@@ -5870,7 +5932,7 @@ DS.Adapter = Ember.Object.extend(DS._Mappable, {
       type: type,
       query: query,
       page: page,
-      pageSize: this.pageSize
+      pageSize: get(this, 'pageSize')
     });
   }
 
@@ -6046,8 +6108,9 @@ DS.FixtureAdapter = DS.Adapter.extend({
   },
 
   handlePagination: function(array, request) {
-    if( request.page && request.pageSize ) {
-      var start = (request.page - 1) * request.pageSize;
+    if( request.pageSize ) {
+      var page = request.page || 1,
+          start = (page - 1) * request.pageSize;
       return array.slice(start, start + request.pageSize);
     }
     else {
@@ -7093,8 +7156,11 @@ DS.RESTAdapter = DS.Adapter.extend({
     @returns Promise
   */
   findAll: function(store, type, request) {
-    var query = this.paginateRequest(null, request);
-    return this.ajax(this.buildURL(type.typeKey), 'GET', { data: query });
+    var query = this.paginateRequest(null, request), hash = {};
+    if (query) {
+      hash.data = query;
+    }
+    return this.ajax(this.buildURL(type.typeKey), 'GET', hash);
   },
 
   /**
@@ -7118,12 +7184,14 @@ DS.RESTAdapter = DS.Adapter.extend({
     @returns Promise
   */
   findQuery: function(store, type, query, recordArray, request) {
-    query = this.paginateRequest(query || {}, request);
+    query = this.paginateRequest(query, request);
     return this.ajax(this.buildURL(type.typeKey), 'GET', { data: query });
   },
 
   paginateRequest: function(query, request) {
-    query = query ? Ember.$.extend({}, query) : {};
+    if (request.sinceToken || request.page || request.pageSize) {
+      query = query || {};
+    }
     if (request.sinceToken) {
       query.since = request.sinceToken;
     }
